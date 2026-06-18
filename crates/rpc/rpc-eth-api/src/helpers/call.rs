@@ -886,7 +886,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
         &self,
         calls: Vec<RpcTxReq<<Self::RpcConvert as RpcConvert>::Network>>,
         block_number: Option<BlockId>,
-        mut state_override: Option<StateOverride>,
+        overrides: EvmOverrides,
     ) -> impl Future<Output = Result<Vec<CallSequenceWithBalanceTrackingResult>, Self::Error>> + Send
     {
         async move {
@@ -906,16 +906,30 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
             }
 
             let (evm_env, at) = self.evm_env_at(target_block).await?;
+            let mut state_override = overrides.state;
+            let block_override = overrides.block;
 
             self.spawn_with_state_at_block(at, move |this, mut db| {
                 let mut results = Vec::with_capacity(calls.len());
 
                 for request in calls {
-                    let overrides = EvmOverrides::new(state_override.take(), None);
+                    let current_state_override = state_override.take();
+                    let overrides =
+                        EvmOverrides::new(current_state_override.clone(), block_override.clone());
                     let (current_evm_env, prepared_tx) =
                         this.prepare_call_env(evm_env.clone(), request, &mut db, overrides)?;
 
-                    let res = this.transact(&mut db, current_evm_env, prepared_tx)?;
+                    let res = if let Some(ref state_overrides) = current_state_override {
+                        let mut evm = this.evm_config().evm_with_env(&mut db, current_evm_env);
+                        simulate::apply_precompile_overrides(
+                            state_overrides,
+                            evm.precompiles_mut(),
+                        )
+                        .map_err(|e| Self::Error::from_eth_err(EthApiError::other(e)))?;
+                        evm.transact(prepared_tx).map_err(Self::Error::from_evm_err)?
+                    } else {
+                        this.transact(&mut db, current_evm_env, prepared_tx)?
+                    };
 
                     let mut native_changes = HashMap::new();
                     for address in res.state.keys().copied() {

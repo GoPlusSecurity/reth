@@ -280,6 +280,7 @@ pub trait EthApi<
         calls: Vec<TxReq>,
         block_number: Option<BlockId>,
         state_overrides: Option<StateOverride>,
+        block_overrides: Option<Box<BlockOverrides>>,
     ) -> RpcResult<Vec<CallSequenceWithBalanceTrackingResult>>;
 
     /// Fills the defaults on a given unsigned transaction.
@@ -805,13 +806,14 @@ where
         calls: Vec<RpcTxReq<T::NetworkTypes>>,
         block_number: Option<BlockId>,
         state_overrides: Option<StateOverride>,
+        block_overrides: Option<Box<BlockOverrides>>,
     ) -> RpcResult<Vec<CallSequenceWithBalanceTrackingResult>> {
-        trace!(target: "rpc::eth", calls = calls.len(), ?block_number, ?state_overrides, "Serving eth_callSequenceWithBalanceTracking");
+        trace!(target: "rpc::eth", calls = calls.len(), ?block_number, ?state_overrides, ?block_overrides, "Serving eth_callSequenceWithBalanceTracking");
         Ok(EthCall::call_sequence_with_balance_tracking(
             self,
             calls,
             block_number,
-            state_overrides,
+            EvmOverrides::new(state_overrides, block_overrides),
         )
         .await?)
     }

@@ -264,6 +264,16 @@ pub trait EthApi<
         block_overrides: Option<Box<BlockOverrides>>,
     ) -> RpcResult<Bytes>;
 
+    /// Executes a message call and returns native/token balance changes.
+    #[method(name = "callWithBalanceTracking")]
+    async fn call_with_balance_tracking(
+        &self,
+        request: TxReq,
+        block_number: Option<BlockId>,
+        state_overrides: Option<StateOverride>,
+        block_overrides: Option<Box<BlockOverrides>>,
+    ) -> RpcResult<CallSequenceWithBalanceTrackingResult>;
+
     /// Executes a new message call immediately without creating a transaction on the block chain.
     #[method(name = "callSequence")]
     async fn call_sequence(
@@ -781,6 +791,24 @@ where
     ) -> RpcResult<Bytes> {
         trace!(target: "rpc::eth", ?request, ?block_number, ?state_overrides, ?block_overrides, "Serving eth_call");
         Ok(EthCall::call(
+            self,
+            request,
+            block_number,
+            EvmOverrides::new(state_overrides, block_overrides),
+        )
+        .await?)
+    }
+
+    /// Handler for: `eth_callWithBalanceTracking`
+    async fn call_with_balance_tracking(
+        &self,
+        request: RpcTxReq<T::NetworkTypes>,
+        block_number: Option<BlockId>,
+        state_overrides: Option<StateOverride>,
+        block_overrides: Option<Box<BlockOverrides>>,
+    ) -> RpcResult<CallSequenceWithBalanceTrackingResult> {
+        trace!(target: "rpc::eth", ?request, ?block_number, ?state_overrides, ?block_overrides, "Serving eth_callWithBalanceTracking");
+        Ok(EthCall::call_with_balance_tracking(
             self,
             request,
             block_number,

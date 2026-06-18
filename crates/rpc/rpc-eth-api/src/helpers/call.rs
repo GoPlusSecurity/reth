@@ -774,6 +774,22 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
         }
     }
 
+    /// Executes a single call and returns native/token balance changes.
+    fn call_with_balance_tracking(
+        &self,
+        request: RpcTxReq<<Self::RpcConvert as RpcConvert>::Network>,
+        block_number: Option<BlockId>,
+        overrides: EvmOverrides,
+    ) -> impl Future<Output = Result<CallSequenceWithBalanceTrackingResult, Self::Error>> + Send
+    {
+        async move {
+            let mut results =
+                self.call_sequence_with_balance_tracking(vec![request], block_number, overrides)
+                    .await?;
+            results.pop().ok_or_else(|| Self::Error::from_eth_err(EthApiError::InternalEthError))
+        }
+    }
+
     /// Executes a sequence of calls over the same ephemeral state snapshot.
     ///
     /// Calls are executed in-order and each transaction state transition is committed into the

@@ -2,6 +2,7 @@
 //! methods.
 
 use core::fmt;
+use std::collections::HashMap;
 
 use super::{LoadBlock, LoadPendingBlock, LoadState, LoadTransaction, SpawnBlocking, Trace};
 use crate::{
@@ -11,7 +12,7 @@ use alloy_consensus::{transaction::TxHashRef, BlockHeader};
 use alloy_eips::eip2930::AccessListResult;
 use alloy_evm::overrides::{apply_block_overrides, apply_state_overrides, OverrideBlockHashes};
 use alloy_network::TransactionBuilder;
-use alloy_primitives::{Bytes, B256, U256};
+use alloy_primitives::{address, keccak256, Address, Bytes, B256, U256};
 use alloy_rpc_types_eth::{
     simulate::{SimBlock, SimulatePayload, SimulatedBlock},
     state::{EvmOverrides, StateOverride},
@@ -47,9 +48,497 @@ use revm::{
 use revm_inspectors::{access_list::AccessListInspector, transfer::TransferInspector};
 use std::collections::BTreeMap;
 use tracing::{trace, warn};
+use serde::{Deserialize, Serialize};
 
 /// Result type for `eth_simulateV1` RPC method.
 pub type SimulatedBlocksResult<N, E> = Result<Vec<SimulatedBlock<RpcBlock<N>>>, E>;
+
+const BASE_WETH_ADDRESS: Address = address!("0x4200000000000000000000000000000000000006");
+
+/// Simplified event log shape returned by `eth_callSequence`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallSequenceLog {
+    /// Contract that emitted this log.
+    pub address: Address,
+    /// Indexed topics emitted by the log.
+    pub topics: Vec<B256>,
+    /// Raw data payload.
+    pub data: Bytes,
+}
+
+/// Per-transaction result returned by `eth_callSequence`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallSequenceResult {
+    /// Whether the transaction call executed without halt/revert.
+    pub ok: bool,
+    /// Return bytes (success output or revert bytes when available).
+    pub result: Bytes,
+    /// Simplified logs from this transaction.
+    pub logs: Vec<CallSequenceLog>,
+    /// Gas used by this transaction.
+    pub used_gas: u64,
+    /// Signed sender balance delta encoded as decimal string.
+    pub from_balance_change: String,
+    /// Decoded or synthesized revert/halt reason; empty on success.
+    pub revert_reason: String,
+}
+
+/// Native balance change for one account.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallSequenceNativeChange {
+    /// Signed delta encoded as decimal string.
+    pub change: String,
+    /// Balance before the call.
+    pub before: String,
+    /// Balance after the call.
+    pub after: String,
+}
+
+/// ERC-721 ownership change for one token id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallSequenceErc721TokenChange {
+    /// Token identifier encoded as decimal string.
+    pub token_id: String,
+    /// `true` if account received ownership, `false` if account lost ownership.
+    pub received: bool,
+}
+
+/// ERC-1155 balance change for one token id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallSequenceErc1155TokenChange {
+    /// Token identifier encoded as decimal string.
+    pub token_id: String,
+    /// Signed token delta encoded as decimal string.
+    pub change: String,
+}
+
+/// Per-transaction result returned by `eth_callSequenceWithBalanceTracking`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallSequenceWithBalanceTrackingResult {
+    /// Whether the transaction call executed without halt/revert.
+    pub ok: bool,
+    /// Return bytes (success output or revert bytes when available).
+    pub result: Bytes,
+    /// Simplified logs from this transaction.
+    pub logs: Vec<CallSequenceLog>,
+    /// Gas used by this transaction.
+    pub used_gas: u64,
+    /// Native balance changes keyed by account.
+    pub native_changes: HashMap<Address, CallSequenceNativeChange>,
+    /// ERC-20 deltas keyed by owner account, then token contract.
+    pub erc20_changes: HashMap<Address, HashMap<Address, String>>,
+    /// ERC-721 ownership changes keyed by owner account, then token contract.
+    pub erc721_changes: HashMap<Address, HashMap<Address, Vec<CallSequenceErc721TokenChange>>>,
+    /// ERC-1155 deltas keyed by owner account, then token contract.
+    pub erc1155_changes: HashMap<Address, HashMap<Address, Vec<CallSequenceErc1155TokenChange>>>,
+    /// Decoded or synthesized revert/halt reason; empty on success.
+    pub revert_reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct SignedAmount {
+    negative: bool,
+    magnitude: U256,
+}
+
+impl SignedAmount {
+    fn add_positive(&mut self, amount: U256) {
+        if amount.is_zero() {
+            return
+        }
+
+        if self.negative {
+            if self.magnitude > amount {
+                self.magnitude -= amount;
+                return
+            }
+            if self.magnitude == amount {
+                self.negative = false;
+                self.magnitude = U256::ZERO;
+                return
+            }
+            self.negative = false;
+            self.magnitude = amount - self.magnitude;
+            return
+        }
+
+        self.magnitude += amount;
+    }
+
+    fn add_negative(&mut self, amount: U256) {
+        if amount.is_zero() {
+            return
+        }
+
+        if self.negative {
+            self.magnitude += amount;
+            return
+        }
+
+        if self.magnitude > amount {
+            self.magnitude -= amount;
+            return
+        }
+        if self.magnitude == amount {
+            self.magnitude = U256::ZERO;
+            return
+        }
+        self.negative = true;
+        self.magnitude = amount - self.magnitude;
+    }
+
+    fn as_string(self) -> String {
+        signed_u256_to_hex(self.negative, self.magnitude)
+    }
+
+    fn is_zero(self) -> bool {
+        self.magnitude.is_zero()
+    }
+}
+
+fn signed_balance_delta(before: U256, after: U256) -> String {
+    if after >= before {
+        signed_u256_to_hex(false, after - before)
+    } else {
+        signed_u256_to_hex(true, before - after)
+    }
+}
+
+fn u256_to_hex(value: U256) -> String {
+    format!("0x{value:x}")
+}
+
+fn signed_u256_to_hex(negative: bool, magnitude: U256) -> String {
+    if magnitude.is_zero() {
+        return String::from("0x0")
+    }
+    if negative {
+        return format!("-0x{magnitude:x}")
+    }
+    format!("0x{magnitude:x}")
+}
+
+fn topic_to_address(topic: &B256) -> Address {
+    let bytes = topic.as_slice();
+    Address::from_slice(&bytes[12..32])
+}
+
+fn u256_from_word(data: &[u8]) -> Option<U256> {
+    if data.len() < 32 {
+        return None
+    }
+
+    let mut word = [0u8; 32];
+    word.copy_from_slice(&data[..32]);
+    Some(U256::from_be_bytes(word))
+}
+
+fn u256_from_topic(topic: &B256) -> U256 {
+    let mut word = [0u8; 32];
+    word.copy_from_slice(topic.as_slice());
+    U256::from_be_bytes(word)
+}
+
+fn parse_abi_u256_array(data: &[u8], offset: usize) -> Option<Vec<U256>> {
+    if offset + 32 > data.len() {
+        return None
+    }
+
+    let len = usize::try_from(u256_from_word(&data[offset..])?).ok()?;
+    let mut items = Vec::with_capacity(len);
+    let mut cursor = offset + 32;
+
+    for _ in 0..len {
+        if cursor + 32 > data.len() {
+            return None
+        }
+        items.push(u256_from_word(&data[cursor..])?);
+        cursor += 32;
+    }
+
+    Some(items)
+}
+
+fn parse_transfer_batch(data: &[u8]) -> Option<Vec<(U256, U256)>> {
+    if data.len() < 64 {
+        return None
+    }
+
+    let ids_offset = usize::try_from(u256_from_word(data)?).ok()?;
+    let values_offset = usize::try_from(u256_from_word(&data[32..])?).ok()?;
+    let ids = parse_abi_u256_array(data, ids_offset)?;
+    let values = parse_abi_u256_array(data, values_offset)?;
+
+    Some(ids.into_iter().zip(values).collect())
+}
+
+fn add_erc20_change(
+    changes: &mut HashMap<Address, HashMap<Address, SignedAmount>>,
+    owner: Address,
+    token: Address,
+    delta: SignedAmount,
+) {
+    if delta.is_zero() {
+        return
+    }
+
+    let token_changes = changes.entry(owner).or_default();
+    let value = token_changes.entry(token).or_default();
+    if delta.negative {
+        value.add_negative(delta.magnitude);
+    } else {
+        value.add_positive(delta.magnitude);
+    }
+}
+
+fn add_erc1155_change(
+    changes: &mut HashMap<Address, HashMap<Address, HashMap<U256, SignedAmount>>>,
+    owner: Address,
+    token: Address,
+    token_id: U256,
+    delta: SignedAmount,
+) {
+    if delta.is_zero() {
+        return
+    }
+
+    let token_map = changes.entry(owner).or_default();
+    let id_map = token_map.entry(token).or_default();
+    let value = id_map.entry(token_id).or_default();
+    if delta.negative {
+        value.add_negative(delta.magnitude);
+    } else {
+        value.add_positive(delta.magnitude);
+    }
+}
+
+fn extract_token_changes(
+    logs: &[alloy_primitives::Log],
+) -> (
+    HashMap<Address, HashMap<Address, String>>,
+    HashMap<Address, HashMap<Address, Vec<CallSequenceErc721TokenChange>>>,
+    HashMap<Address, HashMap<Address, Vec<CallSequenceErc1155TokenChange>>>,
+) {
+    let transfer_topic = keccak256("Transfer(address,address,uint256)");
+    let transfer_single_topic = keccak256("TransferSingle(address,address,address,uint256,uint256)");
+    let transfer_batch_topic = keccak256("TransferBatch(address,address,address,uint256[],uint256[])");
+    let deposit_topic = keccak256("Deposit(address,uint256)");
+    let withdrawal_topic = keccak256("Withdrawal(address,uint256)");
+
+    let zero_address = Address::ZERO;
+
+    let mut erc20_changes: HashMap<Address, HashMap<Address, SignedAmount>> = HashMap::new();
+    let mut erc721_changes: HashMap<Address, HashMap<Address, Vec<CallSequenceErc721TokenChange>>> =
+        HashMap::new();
+    let mut erc1155_changes: HashMap<Address, HashMap<Address, HashMap<U256, SignedAmount>>> =
+        HashMap::new();
+
+    for log in logs {
+        let topics = log.data.topics();
+        if topics.is_empty() {
+            continue
+        }
+
+        let topic0 = topics[0];
+        let data = log.data.data.as_ref();
+
+        if topic0 == transfer_topic {
+            if topics.len() == 3 {
+                let Some(amount) = u256_from_word(data) else {
+                    continue;
+                };
+                let from = topic_to_address(&topics[1]);
+                let to = topic_to_address(&topics[2]);
+
+                if from != zero_address {
+                    add_erc20_change(
+                        &mut erc20_changes,
+                        from,
+                        log.address,
+                        SignedAmount { negative: true, magnitude: amount },
+                    );
+                }
+                if to != zero_address {
+                    add_erc20_change(
+                        &mut erc20_changes,
+                        to,
+                        log.address,
+                        SignedAmount { negative: false, magnitude: amount },
+                    );
+                }
+                continue
+            }
+
+            if topics.len() == 4 {
+                let from = topic_to_address(&topics[1]);
+                let to = topic_to_address(&topics[2]);
+                let token_id = u256_to_hex(u256_from_topic(&topics[3]));
+
+                if from != zero_address {
+                    erc721_changes.entry(from).or_default().entry(log.address).or_default().push(
+                        CallSequenceErc721TokenChange { token_id: token_id.clone(), received: false },
+                    );
+                }
+                if to != zero_address {
+                    erc721_changes.entry(to).or_default().entry(log.address).or_default().push(
+                        CallSequenceErc721TokenChange { token_id, received: true },
+                    );
+                }
+                continue
+            }
+        }
+
+        if topic0 == transfer_single_topic {
+            if topics.len() < 4 {
+                continue
+            }
+            let from = topic_to_address(&topics[2]);
+            let to = topic_to_address(&topics[3]);
+
+            let Some(token_id) = u256_from_word(data) else {
+                continue;
+            };
+            let Some(amount) = u256_from_word(&data[32..]) else {
+                continue;
+            };
+
+            if from != zero_address {
+                add_erc1155_change(
+                    &mut erc1155_changes,
+                    from,
+                    log.address,
+                    token_id,
+                    SignedAmount { negative: true, magnitude: amount },
+                );
+            }
+            if to != zero_address {
+                add_erc1155_change(
+                    &mut erc1155_changes,
+                    to,
+                    log.address,
+                    token_id,
+                    SignedAmount { negative: false, magnitude: amount },
+                );
+            }
+            continue
+        }
+
+        if topic0 == transfer_batch_topic {
+            if topics.len() < 4 {
+                continue
+            }
+            let from = topic_to_address(&topics[2]);
+            let to = topic_to_address(&topics[3]);
+
+            let Some(items) = parse_transfer_batch(data) else {
+                continue;
+            };
+
+            for (token_id, amount) in items {
+                if from != zero_address {
+                    add_erc1155_change(
+                        &mut erc1155_changes,
+                        from,
+                        log.address,
+                        token_id,
+                        SignedAmount { negative: true, magnitude: amount },
+                    );
+                }
+                if to != zero_address {
+                    add_erc1155_change(
+                        &mut erc1155_changes,
+                        to,
+                        log.address,
+                        token_id,
+                        SignedAmount { negative: false, magnitude: amount },
+                    );
+                }
+            }
+            continue
+        }
+
+        if topic0 == deposit_topic {
+            if log.address != BASE_WETH_ADDRESS || topics.len() < 2 {
+                continue
+            }
+            let to = topic_to_address(&topics[1]);
+            let Some(amount) = u256_from_word(data) else {
+                continue;
+            };
+            if to != zero_address {
+                add_erc20_change(
+                    &mut erc20_changes,
+                    to,
+                    log.address,
+                    SignedAmount { negative: false, magnitude: amount },
+                );
+            }
+            continue
+        }
+
+        if topic0 == withdrawal_topic {
+            if log.address != BASE_WETH_ADDRESS || topics.len() < 2 {
+                continue
+            }
+            let from = topic_to_address(&topics[1]);
+            let Some(amount) = u256_from_word(data) else {
+                continue;
+            };
+            if from != zero_address {
+                add_erc20_change(
+                    &mut erc20_changes,
+                    from,
+                    log.address,
+                    SignedAmount { negative: true, magnitude: amount },
+                );
+            }
+        }
+    }
+
+    let mut erc20_out: HashMap<Address, HashMap<Address, String>> = HashMap::new();
+    for (owner, by_token) in erc20_changes {
+        let mut token_map = HashMap::new();
+        for (token, delta) in by_token {
+            if !delta.is_zero() {
+                token_map.insert(token, delta.as_string());
+            }
+        }
+        if !token_map.is_empty() {
+            erc20_out.insert(owner, token_map);
+        }
+    }
+
+    let mut erc1155_out: HashMap<Address, HashMap<Address, Vec<CallSequenceErc1155TokenChange>>> =
+        HashMap::new();
+    for (owner, by_token) in erc1155_changes {
+        let mut token_map = HashMap::new();
+        for (token, by_id) in by_token {
+            let mut id_changes = Vec::new();
+            for (token_id, delta) in by_id {
+                if !delta.is_zero() {
+                    id_changes.push(CallSequenceErc1155TokenChange {
+                        token_id: u256_to_hex(token_id),
+                        change: delta.as_string(),
+                    });
+                }
+            }
+            if !id_changes.is_empty() {
+                token_map.insert(token, id_changes);
+            }
+        }
+        if !token_map.is_empty() {
+            erc1155_out.insert(owner, token_map);
+        }
+    }
+
+    (erc20_out, erc721_changes, erc1155_out)
+}
 
 /// Execution related functions for the [`EthApiServer`](crate::EthApiServer) trait in
 /// the `eth_` namespace.
@@ -282,6 +771,262 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                 self.transact_call_at(request, block_number.unwrap_or_default(), overrides).await?;
 
             Self::Error::ensure_success(res.result)
+        }
+    }
+
+    /// Executes a sequence of calls over the same ephemeral state snapshot.
+    ///
+    /// Calls are executed in-order and each transaction state transition is committed into the
+    /// runtime database so subsequent calls observe prior writes.
+    fn call_sequence(
+        &self,
+        calls: Vec<RpcTxReq<<Self::RpcConvert as RpcConvert>::Network>>,
+        block_number: Option<BlockId>,
+        mut state_override: Option<StateOverride>,
+    ) -> impl Future<Output = Result<Vec<CallSequenceResult>, Self::Error>> + Send {
+        async move {
+            if calls.is_empty() {
+                return Err(EthApiError::InvalidParams(String::from("calls are empty.")).into())
+            }
+
+            let mut target_block = block_number.unwrap_or_default();
+
+            if !target_block.is_pending() {
+                target_block = self
+                    .provider()
+                    .block_hash_for_id(target_block)
+                    .map_err(|_| EthApiError::HeaderNotFound(target_block))?
+                    .ok_or_else(|| EthApiError::HeaderNotFound(target_block))?
+                    .into();
+            }
+
+            let (evm_env, at) = self.evm_env_at(target_block).await?;
+
+            self.spawn_with_state_at_block(at, move |this, mut db| {
+                let mut results = Vec::with_capacity(calls.len());
+
+                for request in calls {
+                    let overrides = EvmOverrides::new(state_override.take(), None);
+                    let (current_evm_env, prepared_tx) =
+                        this.prepare_call_env(evm_env.clone(), request, &mut db, overrides)?;
+
+                    let caller = prepared_tx.caller();
+
+                    let before_balance = db
+                        .basic(caller)
+                        .map_err(|err: EvmDatabaseError<ProviderError>| {
+                            Self::Error::from_eth_err(err)
+                        })?
+                        .map(|acc| acc.balance)
+                        .unwrap_or_default();
+
+                    let res = this.transact(&mut db, current_evm_env, prepared_tx)?;
+
+                    let used_gas = res.result.tx_gas_used();
+                    let (ok, result, logs, revert_reason) = match res.result {
+                        revm::context_interface::result::ExecutionResult::Success {
+                            output,
+                            logs,
+                            ..
+                        } => {
+                            let logs = logs
+                                .into_iter()
+                                .map(|log| CallSequenceLog {
+                                    address: log.address,
+                                    topics: log.data.topics().to_vec(),
+                                    data: log.data.data,
+                                })
+                                .collect();
+                            (true, output.into_data(), logs, String::new())
+                        }
+                        revm::context_interface::result::ExecutionResult::Revert {
+                            output,
+                            ..
+                        } => {
+                            let revert_reason = String::from("execution reverted");
+                            (false, output, Vec::new(), revert_reason)
+                        }
+                        revm::context_interface::result::ExecutionResult::Halt {
+                            reason,
+                            ..
+                        } => {
+                            let revert_reason = format!("halt: {reason:?}");
+                            (false, Bytes::new(), Vec::new(), revert_reason)
+                        }
+                    };
+
+                    db.commit(res.state);
+
+                    let after_balance = db
+                        .basic(caller)
+                        .map_err(|err: EvmDatabaseError<ProviderError>| {
+                            Self::Error::from_eth_err(err)
+                        })?
+                        .map(|acc| acc.balance)
+                        .unwrap_or_default();
+
+                    results.push(CallSequenceResult {
+                        ok,
+                        result,
+                        logs,
+                        used_gas,
+                        from_balance_change: signed_balance_delta(before_balance, after_balance),
+                        revert_reason,
+                    });
+                }
+
+                Ok(results)
+            })
+            .await
+        }
+    }
+
+    /// Executes a sequence of calls and returns per-call native/token balance changes.
+    fn call_sequence_with_balance_tracking(
+        &self,
+        calls: Vec<RpcTxReq<<Self::RpcConvert as RpcConvert>::Network>>,
+        block_number: Option<BlockId>,
+        mut state_override: Option<StateOverride>,
+    ) -> impl Future<Output = Result<Vec<CallSequenceWithBalanceTrackingResult>, Self::Error>> + Send
+    {
+        async move {
+            if calls.is_empty() {
+                return Err(EthApiError::InvalidParams(String::from("calls are empty.")).into())
+            }
+
+            let mut target_block = block_number.unwrap_or_default();
+
+            if !target_block.is_pending() {
+                target_block = self
+                    .provider()
+                    .block_hash_for_id(target_block)
+                    .map_err(|_| EthApiError::HeaderNotFound(target_block))?
+                    .ok_or_else(|| EthApiError::HeaderNotFound(target_block))?
+                    .into();
+            }
+
+            let (evm_env, at) = self.evm_env_at(target_block).await?;
+
+            self.spawn_with_state_at_block(at, move |this, mut db| {
+                let mut results = Vec::with_capacity(calls.len());
+
+                for request in calls {
+                    let overrides = EvmOverrides::new(state_override.take(), None);
+                    let (current_evm_env, prepared_tx) =
+                        this.prepare_call_env(evm_env.clone(), request, &mut db, overrides)?;
+
+                    let res = this.transact(&mut db, current_evm_env, prepared_tx)?;
+
+                    let mut native_changes = HashMap::new();
+                    for address in res.state.keys().copied() {
+                        let before = db
+                            .basic(address)
+                            .map_err(|err: EvmDatabaseError<ProviderError>| {
+                                Self::Error::from_eth_err(err)
+                            })?
+                            .map(|acc| acc.balance)
+                            .unwrap_or_default();
+
+                        let after = res
+                            .state
+                            .get(&address)
+                            .map(|acc| acc.info.balance)
+                            .unwrap_or_default();
+
+                        if before != after {
+                            native_changes.insert(
+                                address,
+                                CallSequenceNativeChange {
+                                    change: if after >= before {
+                                        signed_u256_to_hex(false, after - before)
+                                    } else {
+                                        signed_u256_to_hex(true, before - after)
+                                    },
+                                    before: u256_to_hex(before),
+                                    after: u256_to_hex(after),
+                                },
+                            );
+                        }
+                    }
+
+                    let used_gas = res.result.tx_gas_used();
+                    let (ok, result, logs, erc20_changes, erc721_changes, erc1155_changes, revert_reason) =
+                        match res.result {
+                            revm::context_interface::result::ExecutionResult::Success {
+                                output,
+                                logs,
+                                ..
+                            } => {
+                                let (erc20_changes, erc721_changes, erc1155_changes) =
+                                    extract_token_changes(&logs);
+                                let rpc_logs = logs
+                                    .into_iter()
+                                    .map(|log| CallSequenceLog {
+                                        address: log.address,
+                                        topics: log.data.topics().to_vec(),
+                                        data: log.data.data,
+                                    })
+                                    .collect();
+                                (
+                                    true,
+                                    output.into_data(),
+                                    rpc_logs,
+                                    erc20_changes,
+                                    erc721_changes,
+                                    erc1155_changes,
+                                    String::new(),
+                                )
+                            }
+                            revm::context_interface::result::ExecutionResult::Revert {
+                                output,
+                                ..
+                            } => {
+                                let revert_reason = String::from("execution reverted");
+                                (
+                                    false,
+                                    output,
+                                    Vec::new(),
+                                    HashMap::new(),
+                                    HashMap::new(),
+                                    HashMap::new(),
+                                    revert_reason,
+                                )
+                            }
+                            revm::context_interface::result::ExecutionResult::Halt {
+                                reason,
+                                ..
+                            } => {
+                                let revert_reason = format!("halt: {reason:?}");
+                                (
+                                    false,
+                                    Bytes::new(),
+                                    Vec::new(),
+                                    HashMap::new(),
+                                    HashMap::new(),
+                                    HashMap::new(),
+                                    revert_reason,
+                                )
+                            }
+                        };
+
+                    db.commit(res.state);
+
+                    results.push(CallSequenceWithBalanceTrackingResult {
+                        ok,
+                        result,
+                        logs,
+                        used_gas,
+                        native_changes,
+                        erc20_changes,
+                        erc721_changes,
+                        erc1155_changes,
+                        revert_reason,
+                    });
+                }
+
+                Ok(results)
+            })
+            .await
         }
     }
 

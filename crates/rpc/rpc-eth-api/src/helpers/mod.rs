@@ -32,7 +32,16 @@ pub mod transaction;
 pub use bal::GetBlockAccessList;
 pub use block::{EthBlocks, LoadBlock};
 pub use blocking_task::SpawnBlocking;
-pub use call::{Call, EthCall};
+pub use call::{
+    Call, 
+    CallSequenceErc1155TokenChange,
+    CallSequenceErc721TokenChange,
+    CallSequenceLog,
+    CallSequenceNativeChange,
+    CallSequenceResult,
+    CallSequenceWithBalanceTrackingResult,
+    EthCall,
+};
 pub use fee::{EthFees, LoadFee};
 pub use pending_block::LoadPendingBlock;
 pub use receipt::LoadReceipt;

@@ -1,7 +1,10 @@
 //! Implementation of the [`jsonrpsee`] generated [`EthApiServer`] trait. Handles RPC requests for
 //! the `eth_` namespace.
 use crate::{
-    helpers::{EthApiSpec, EthBlocks, EthCall, EthFees, EthState, EthTransactions, FullEthApi},
+    helpers::{
+        EthApiSpec, EthBlocks, EthCall, EthFees, EthState, EthTransactions, FullEthApi,
+        CallSequenceResult, CallSequenceWithBalanceTrackingResult,
+    },
     RpcBlock, RpcHeader, RpcReceipt, RpcTransaction,
 };
 use alloy_dyn_abi::TypedData;
@@ -260,6 +263,24 @@ pub trait EthApi<
         state_overrides: Option<StateOverride>,
         block_overrides: Option<Box<BlockOverrides>>,
     ) -> RpcResult<Bytes>;
+
+    /// Executes a new message call immediately without creating a transaction on the block chain.
+    #[method(name = "callSequence")]
+    async fn call_sequence(
+        &self,
+        calls: Vec<TxReq>,
+        block_number: Option<BlockId>,
+        state_overrides: Option<StateOverride>,
+    ) -> RpcResult<Vec<CallSequenceResult>>;
+
+    /// Executes a sequence of message calls and returns native/token balance changes per call.
+    #[method(name = "callSequenceWithBalanceTracking")]
+    async fn call_sequence_with_balance_tracking(
+        &self,
+        calls: Vec<TxReq>,
+        block_number: Option<BlockId>,
+        state_overrides: Option<StateOverride>,
+    ) -> RpcResult<Vec<CallSequenceWithBalanceTrackingResult>>;
 
     /// Fills the defaults on a given unsigned transaction.
     #[method(name = "fillTransaction")]
@@ -763,6 +784,34 @@ where
             request,
             block_number,
             EvmOverrides::new(state_overrides, block_overrides),
+        )
+        .await?)
+    }
+
+    /// Handler for: `eth_callSequence`
+    async fn call_sequence(
+        &self,
+        calls: Vec<RpcTxReq<T::NetworkTypes>>,
+        block_number: Option<BlockId>,
+        state_overrides: Option<StateOverride>,
+    ) -> RpcResult<Vec<CallSequenceResult>> {
+        trace!(target: "rpc::eth", calls = calls.len(), ?block_number, ?state_overrides, "Serving eth_callSequence");
+        Ok(EthCall::call_sequence(self, calls, block_number, state_overrides).await?)
+    }
+
+    /// Handler for: `eth_callSequenceWithBalanceTracking`
+    async fn call_sequence_with_balance_tracking(
+        &self,
+        calls: Vec<RpcTxReq<T::NetworkTypes>>,
+        block_number: Option<BlockId>,
+        state_overrides: Option<StateOverride>,
+    ) -> RpcResult<Vec<CallSequenceWithBalanceTrackingResult>> {
+        trace!(target: "rpc::eth", calls = calls.len(), ?block_number, ?state_overrides, "Serving eth_callSequenceWithBalanceTracking");
+        Ok(EthCall::call_sequence_with_balance_tracking(
+            self,
+            calls,
+            block_number,
+            state_overrides,
         )
         .await?)
     }
